@@ -248,6 +248,7 @@ class TranslationService : Service() {
         overlay?.setPaused(paused)
     }
 
+    
     private val tick = object : Runnable {
         override fun run() {
             if (!running || destroyed) return
@@ -257,7 +258,36 @@ class TranslationService : Service() {
                 return
             }
 
-            // 오버레이가 캡처 영상에 다시 들어가는 것을 줄입니다.
+            // 번역 완료 후 또는 번역 처리 중에는
+            // 오버레이를 숨기지 않고 화면 변화를 확인합니다.
+            if (completedRevision == revision || busy) {
+                var frame: Bitmap? = null
+
+                try {
+                    frame = captureBitmap()
+
+                    if (frame != null && visibleContentChanged(frame)) {
+                        revision++
+                        completedRevision = -1
+                        previousSample = null
+
+                        overlay?.clear()
+                        overlay?.setStatus("대기")
+                    }
+                } catch (_: Exception) {
+                    // 일시적인 캡처 실패는 다음 확인 때 재시도합니다.
+                } finally {
+                    frame?.recycle()
+
+                    if (running && !destroyed) {
+                        handler.postDelayed(this, 850)
+                    }
+                }
+
+                return
+            }
+
+            // 새 화면을 인식할 때만 잠깐 숨깁니다.
             overlay?.setCaptureHidden(true)
 
             try {
@@ -271,18 +301,86 @@ class TranslationService : Service() {
                 try {
                     if (!paused) {
                         val bitmap = captureBitmap()
-                        if (bitmap != null) inspectFrame(bitmap)
+                        if (bitmap != null) {
+                            inspectFrame(bitmap)
+                        }
                     }
                 } catch (_: Exception) {
                     if (!paused) overlay?.setStatus("재시도")
                 } finally {
                     overlay?.setCaptureHidden(false)
+
                     if (running && !destroyed) {
                         handler.postDelayed(this, 850)
                     }
                 }
             }, 180)
         }
+    }
+
+    private fun visibleContentChanged(bitmap: Bitmap): Boolean {
+        val previous = previousSample ?: return true
+        val current = makeSample(bitmap)
+
+        val covered = overlay?.getCoveredScreenRects()
+            ?: emptyList()
+
+        // 샘플 축소 과정에서 상자 가장자리 색상이 섞이는 것을
+        // 줄이기 위해 제외 영역에 여유를 둡니다.
+        val paddingX = maxOf(12, bitmap.width / 48)
+        val paddingY = maxOf(12, bitmap.height / 80)
+
+        var difference = 0L
+        var checked = 0
+
+        for (row in 0 until 80) {
+            val y = ((row + 0.5f) * bitmap.height / 80).toInt()
+
+            // 시계, 배터리, 하단 시스템 영역의 변화는 제외합니다.
+            if (y < bitmap.height * 0.05f ||
+                y > bitmap.height * 0.95f
+            ) {
+                continue
+            }
+
+            for (column in 0 until 48) {
+                val x = (
+                    (column + 0.5f) * bitmap.width / 48
+                ).toInt()
+
+                val coveredByOverlay = covered.any { rect ->
+                    x >= rect.left - paddingX &&
+                        x < rect.right + paddingX &&
+                        y >= rect.top - paddingY &&
+                        y < rect.bottom + paddingY
+                }
+
+                if (coveredByOverlay) continue
+
+                val index = row * 48 + column
+                val a = previous[index]
+                val b = current[index]
+
+                difference += abs(
+                    ((a shr 16) and 255) -
+                        ((b shr 16) and 255)
+                )
+                difference += abs(
+                    ((a shr 8) and 255) -
+                        ((b shr 8) and 255)
+                )
+                difference += abs(
+                    (a and 255) - (b and 255)
+                )
+
+                checked++
+            }
+        }
+
+        // 대부분이 번역 상자로 덮여 있으면 판단을 보류합니다.
+        if (checked < 100) return false
+
+        return difference.toDouble() / (checked * 3) > 3.0
     }
 
     private fun captureBitmap(): Bitmap? {
